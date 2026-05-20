@@ -70,7 +70,22 @@ async def lifespan(app: FastAPI):
     logger.info("LLM model: %s | base_url: %s", settings.llm_model, settings.llm_base_url)
     logger.info("DB: %s", settings.database_url)
     logger.info("=" * 60)
+
+    # Ensure database tables exist (dev fallback — in production use alembic upgrade head)
+    try:
+        from core.database import engine, Base
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables verified/created via create_all")
+    except Exception as exc:
+        logger.warning(
+            "Auto table creation failed (DB not reachable?): %s. "
+            "Run 'alembic upgrade head' manually.",
+            exc,
+        )
+
     yield
+
     from core.embedding import EmbeddingService
     EmbeddingService.unload()
     logger.info("App shut down")
