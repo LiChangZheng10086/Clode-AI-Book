@@ -180,6 +180,10 @@ class ChapterWriter:
         if world:
             parts.append(f"世界观设定：\n{json.dumps(world, ensure_ascii=False)}")
 
+        past_chunks = context_package.get("past_chapter_chunks", [])
+        if past_chunks:
+            parts.append(f"【向量检索】相关历史片段（用于保持细节连贯）：\n{json.dumps(past_chunks, ensure_ascii=False)}")
+
         voices = context_package.get("character_voices", [])
         if voices:
             parts.append(f"角色语调卡：\n{json.dumps(voices, ensure_ascii=False, indent=2)}")

@@ -335,7 +335,46 @@ async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
     """A6: Generate chapter content + polish, or revise based on review feedback."""
     writer = ChapterWriter()
     context = state.get("context_package", {})
-    review_report = context.get("review_report") if isinstance(context, dict) else None
+    if not isinstance(context, dict):
+        context = {}
+
+    # ── Enrich context with vector-retrieved chunks ──────────────
+    chapter_outline = state.get("chapter_outline", {})
+    novel_id = state.get("novel_id", "")
+    if chapter_outline and novel_id:
+        try:
+            from memory.retriever import ContextRetriever
+            from core.database import async_session
+            async with async_session() as db:
+                retriever = ContextRetriever(db)
+                vec_ctx = await retriever.build_context_chunks(chapter_outline, UUID(novel_id))
+                if vec_ctx.get("world_setting_chunks"):
+                    existing = context.get("world_setting_chunks", [])
+                    context["world_setting_chunks"] = existing + vec_ctx["world_setting_chunks"]
+                if vec_ctx.get("past_chapter_chunks"):
+                    context["past_chapter_chunks"] = vec_ctx["past_chapter_chunks"]
+                    await _emit(config, {
+                        "type": "progress", "agent": "retriever",
+                        "message": f"向量检索到 {len(vec_ctx['past_chapter_chunks'])} 条相关历史片段",
+                    })
+        except Exception:
+            logger.exception("Vector retrieval enrichment failed in node_chapter_write")
+
+    # ── Ensure all expected fields have defaults ─────────────────
+    for key, default in (
+        ("volume_summary", "无"),
+        ("recent_summaries", []),
+        ("prev_chapter_content", ""),
+        ("pending_hooks", []),
+        ("entity_states", {}),
+        ("style_profile", {}),
+        ("world_setting_chunks", []),
+        ("character_voices", []),
+        ("past_chapter_chunks", []),
+    ):
+        context.setdefault(key, default)
+
+    review_report = context.get("review_report")
     original_content = state.get("polished_content") or state.get("chapter_content") or ""
 
     if review_report and original_content:
@@ -348,7 +387,7 @@ async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
         # Fresh write mode
         await _emit(config, {"type": "agent_start", "agent": "A6", "message": "正在撰写章节正文..."})
         content = await writer.write(
-            chapter_outline=state.get("chapter_outline", {}),
+            chapter_outline=chapter_outline,
             context_package=context,
         )
         await _emit(config, {"type": "content_stream", "content": content[:500] + "..."})
