@@ -130,21 +130,51 @@ class ChapterWriter:
 写作完成后你会被润色器自动处理，所以原文可以稍微直接一些，
 但请确保内容完整、情节连贯、角色一致。"""
 
-    REVISION_PROMPT = """你需要根据审核报告修改以下章节内容。
+    PATCH_PROMPT = """你是一位精准修改师。你的任务是根据审核报告，对原文进行**最小粒度的精确修改**。
 
 审核报告指出了以下需要修改的问题：
 {review_issues}
 
-请逐条修改。修改规则：
-- 只修改问题涉及的部分
-- 保持未提及的部分不变
-- 确保修改后和新内容风格统一
-- 输出修改后的完整章节正文
+请你针对每个问题输出一个 JSON Patch。**严禁重写整个段落**，只修改有问题的部分。
 
-原文：
-{original_content}
+==== 修改规则 ====
+1. 每个 patch 的 target 必须**与原文逐字匹配**（标点符号、空格都不能错）
+2. target 长度不超过 200 个字（整句或相邻几句话）
+3. replacement 只替换 target 中**有问题的部分**，不要改动周围上下文
+4. 不需要修改的部分**绝不**出现在 patches 里
+5. 多个 patch 按在文中出现的先后顺序排列
 
-请输出修改后的完整正文："""
+==== 操作流程 ====
+修改工作在原始文本上依次执行。从原始文本开头开始，找到最早的 target，
+替换为 replacement。每应用一个 patch 之后，从替换后的文本开头重新扫描，
+找下一个 target。**所以 patches 必须按文中先后顺序排列，且不要重叠。**
+
+==== 输出格式 ====
+```json
+[
+  {{
+    "target": "原文中必须替换的段落（与原文完全一致）",
+    "replacement": "替换后的新段落",
+    "reason": "修复的问题编号"
+  }}
+]
+```
+
+如果没有需要修改的内容（审核误判），返回空数组 []。
+
+==== 示例 ====
+原句：「林凡微微一笑，然后说道：『师傅，古戒上出现了新的铭文，我不太明白这是什么意思。』只因师傅曾教导他要虚心求教。」
+审核意见：林凡话太多（设定话少），且「然后」是 AI 高频词。
+
+预期输出：
+```json
+[
+  {{
+    "target": "林凡微微一笑，然后说道：『师傅，古戒上出现了新的铭文，我不太明白这是什么意思。』只因师傅曾教导他要虚心求教。",
+    "replacement": "林凡低头看了看古戒，没说话，只是把戒面转向青云真人。——只因师傅曾教导他要虚心求教。"
+  }}
+]
+```"""
 
     def __init__(self, llm: BaseChatModel | None = None):
         self.llm = llm or get_llm()
@@ -205,26 +235,28 @@ class ChapterWriter:
             if chunk.content:
                 yield chunk.content
 
+    # ── Revision via structured patches ───────────────────────
+
     async def revise(self, original_content: str, review_report: dict) -> str:
-        issues = review_report.get("issues", [])
-        issues_text = ""
-        for i, issue in enumerate(issues, 1):
-            issues_text += f"""
-问题 {i} (严重程度: {issue.get('severity')}) — {issue.get('dimension')}
-位置: {issue.get('location', '全文')}
-问题描述: {issue.get('problem', '')}
-修改建议: {issue.get('suggestion', '')}
-"""
-        prompt = self.REVISION_PROMPT.format(
-            review_issues=issues_text,
-            original_content=original_content,
-        )
-        response = await self.llm.ainvoke([SystemMessage(content=self.SYSTEM_PROMPT), HumanMessage(content=prompt)])
-        return response.content
+        patches = await self._generate_patches(original_content, review_report)
+        if patches:
+            return self._apply_patches(original_content, patches)
+        return original_content
 
     async def stream_revise(
         self, original_content: str, review_report: dict
     ) -> AsyncIterator[str]:
+        patches = await self._generate_patches(original_content, review_report)
+        if patches:
+            revised = self._apply_patches(original_content, patches)
+        else:
+            revised = original_content
+        yield revised
+
+    async def _generate_patches(
+        self, original_content: str, review_report: dict
+    ) -> list[dict]:
+        """Ask LLM for structured patches, parse and validate."""
         issues = review_report.get("issues", [])
         issues_text = ""
         for i, issue in enumerate(issues, 1):
@@ -234,10 +266,82 @@ class ChapterWriter:
 问题描述: {issue.get('problem', '')}
 修改建议: {issue.get('suggestion', '')}
 """
-        prompt = self.REVISION_PROMPT.format(
+
+        prompt = self.PATCH_PROMPT.format(
             review_issues=issues_text,
             original_content=original_content,
         )
-        async for chunk in self.llm.astream([SystemMessage(content=self.SYSTEM_PROMPT), HumanMessage(content=prompt)]):
-            if chunk.content:
-                yield chunk.content
+        try:
+            response = await self.llm.ainvoke([SystemMessage(content=prompt)])
+            return self._parse_patches((response.content or ""))
+        except Exception:
+            logger = __import__("logging").getLogger(__name__)
+            logger.exception("A6 _generate_patches failed")
+            return []
+
+    def _parse_patches(self, content: str) -> list[dict]:
+        """Extract JSON patch array from LLM response."""
+        if not content:
+            return []
+
+        # Try code fence first
+        import re
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
+        text = m.group(1) if m else content
+
+        try:
+            patches = json.loads(text)
+        except json.JSONDecodeError:
+            # Try extracting from first { to last ]
+            try:
+                start = text.index("[")
+                end = text.rindex("]") + 1
+                patches = json.loads(text[start:end])
+            except (ValueError, json.JSONDecodeError):
+                return []
+
+        if not isinstance(patches, list):
+            return []
+
+        # Validate each patch
+        valid = []
+        for p in patches:
+            if isinstance(p, dict) and p.get("target") and isinstance(p["target"], str):
+                p["replacement"] = p.get("replacement", "")
+                valid.append(p)
+        return valid
+
+    def _apply_patches(self, original: str, patches: list[dict]) -> str:
+        """Apply patches sequentially. Each patch replaces an exact match.
+
+        Patches MUST be in document order (earliest first) and MUST NOT overlap.
+        After each replacement, the next patch is searched in the modified text.
+        """
+        result = original
+        applied = 0
+        skipped = 0
+
+        for i, patch in enumerate(patches):
+            target = patch["target"]
+            replacement = patch["replacement"]
+            pos = result.find(target)
+
+            if pos != -1:
+                result = result[:pos] + replacement + result[pos + len(target):]
+                applied += 1
+            else:
+                # Retry with stripped whitespace (fuzzy fallback)
+                target_stripped = target.strip()
+                pos2 = result.find(target_stripped)
+                if pos2 != -1:
+                    result = result[:pos2] + replacement + result[pos2 + len(target_stripped):]
+                    applied += 1
+                else:
+                    skipped += 1
+
+        logger = __import__("logging").getLogger(__name__)
+        logger.info(
+            "A6 revise: applied %d patches, skipped %d (out of %d)",
+            applied, skipped, len(patches),
+        )
+        return result

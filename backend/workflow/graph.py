@@ -374,7 +374,9 @@ async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
     ):
         context.setdefault(key, default)
 
-    review_report = context.get("review_report")
+    # review_report is set in state by node_chapter_review's return value.
+    # Also check context as fallback for manual/retry flows from the frontend.
+    review_report = state.get("review_report") or context.get("review_report")
     original_content = state.get("polished_content") or state.get("chapter_content") or ""
 
     if review_report and original_content:
