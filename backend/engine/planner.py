@@ -2,12 +2,12 @@
 
 import json
 import logging
-import re
 from typing import AsyncIterator
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from core.json_utils import repair_json, repair_truncated, extract_json_block
 from core.llm import get_planning_llm
 
 logger = logging.getLogger(__name__)
@@ -18,148 +18,10 @@ _SKIP_ASKING_HINT = (
     "不要生成 status: \"asking\" 的决策点。"
 )
 
-
-def _repair_json(text: str) -> str | None:
-    """Try to repair common LLM JSON errors. Returns repaired text or None."""
-    # Remove trailing commas before ] or } — the most common LLM mistake
-    repaired = re.sub(r",\s*([}\]])", r"\1", text)
-    if repaired != text:
-        try:
-            json.loads(repaired)
-            return repaired
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def _repair_truncated(text: str, closers: list[str]) -> str | None:
-    """Try to repair truncated JSON by appending missing closing braces/brackets.
-
-    Args:
-        text: The truncated JSON text (from first { to end of content).
-        closers: Stack of closing characters needed, in LIFO order (innermost first).
-    """
-    suffix = "".join(closers)
-    repaired = text + suffix
-    # Remove trailing comma/cutoff before closing
-    repaired = re.sub(r",\s*$", "", repaired)
-    try:
-        json.loads(repaired)
-        return repaired
-    except json.JSONDecodeError:
-        pass
-    return None
-
-
-def _extract_json(content: str) -> dict | None:
-    """Robust JSON extraction from LLM output.
-
-    Strategies (tried in order):
-    1. Markdown code fence (```json ... ```)
-    2. Brace-counted outermost { ... } (with repair for trailing commas & truncation)
-    3. All regex-matched JSON objects, pick the largest
-    """
-    if not content:
-        return None
-
-    # Strategy 1: markdown code fence
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Strategy 2: find the outermost JSON object via brace counting.
-    # The LLM may output non-JSON text with braces (e.g. "主角{姜小卦}") before
-    # the real JSON. We scan { positions but STOP if a large candidate fails —
-    # that means the real JSON is malformed and we should fall through to the
-    # raw-content fallback rather than picking a nested fragment.
-    pos = 0
-    while True:
-        start = content.find("{", pos)
-        if start == -1:
-            break
-        depth = 0
-        in_string = False
-        escape = False
-        closer_stack: list[str] = []  # Track "}" / "]" needed in LIFO order
-        for i in range(start, len(content)):
-            ch = content[i]
-            if escape:
-                escape = False
-                continue
-            if ch == "\\" and in_string:
-                escape = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-                closer_stack.append("}")
-            elif ch == "}":
-                depth -= 1
-                if closer_stack and closer_stack[-1] == "}":
-                    closer_stack.pop()
-            elif ch == "[":
-                closer_stack.append("]")
-            elif ch == "]":
-                if closer_stack and closer_stack[-1] == "]":
-                    closer_stack.pop()
-
-            if depth == 0:
-                candidate = content[start:i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError as exc:
-                    repaired = _repair_json(candidate)
-                    if repaired is not None:
-                        logger.debug("_extract_json: repaired trailing commas (%d chars)", len(candidate))
-                        return json.loads(repaired)
-                    # If this is a large candidate, it IS the real JSON — don't
-                    # keep scanning for smaller nested objects. Break out and
-                    # fall through to strategy 3 / raw fallback.
-                    logger.debug(
-                        "_extract_json: JSON parse failed (%d chars at pos %d): %s. %s",
-                        len(candidate), start, exc.msg,
-                        "Large candidate — stopping scan." if len(candidate) > 500 else "Trying next {.",
-                    )
-                    if len(candidate) > 500:
-                        pos = -1  # Signal to break the outer while
-                break  # Exit inner loop
-        else:
-            # Loop finished without break → reached end of content at depth > 0
-            # JSON is likely truncated (max_tokens limit). Try to repair.
-            if closer_stack:
-                repaired = _repair_truncated(content[start:], closer_stack)
-                if repaired is not None:
-                    logger.debug("_extract_json: repaired truncated JSON (%d chars + %d closers)",
-                                 len(content) - start, len(closer_stack))
-                    return json.loads(repaired)
-                logger.debug("_extract_json: truncation repair failed (%d chars, %d closers)",
-                             len(content) - start, len(closer_stack))
-        if pos == -1:
-            break
-        pos = start + 1
-
-    # Strategy 3: find ALL JSON objects and pick the largest
-    candidates = re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", content, re.DOTALL)
-    best = None
-    for m in candidates:
-        try:
-            obj = json.loads(m.group())
-            if best is None or len(json.dumps(obj)) > len(json.dumps(best)):
-                best = obj
-        except json.JSONDecodeError:
-            pass
-    if best is not None:
-        logger.debug("_extract_json: strategy 3 found object with %d keys", len(best))
-        return best
-
-    return None
+# Backward-compatible aliases for modules importing from planner
+_repair_json = repair_json
+_repair_truncated = repair_truncated
+_extract_json = extract_json_block
 
 
 def _parse_llm_response(content: str, fallback_key: str) -> dict:

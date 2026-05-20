@@ -103,15 +103,13 @@ class ConsistencyChecker:
             }
 
     def _parse(self, content: str) -> dict:
-        try:
-            start = content.index("{")
-            end = content.rindex("}") + 1
-            data = json.loads(content[start:end])
+        from core.json_utils import extract_json_block
+        result = extract_json_block(content)
+        if result is not None:
             return {
-                "score": data.get("score", -1),
-                "issues": data.get("issues", []),
-                "summary": data.get("summary", ""),
+                "score": result.get("score", -1),
+                "issues": result.get("issues", []),
+                "summary": result.get("summary", ""),
             }
-        except (ValueError, json.JSONDecodeError):
-            logger.warning("Failed to parse consistency check result")
-            return {"score": -1, "issues": [], "summary": "检查结果解析失败"}
+        logger.warning("Failed to parse consistency check result")
+        return {"score": -1, "issues": [], "summary": "检查结果解析失败"}

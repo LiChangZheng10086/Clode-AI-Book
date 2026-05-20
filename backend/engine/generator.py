@@ -284,22 +284,8 @@ class ChapterWriter:
         if not content:
             return []
 
-        # Try code fence first
-        import re
-        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", content, re.DOTALL)
-        text = m.group(1) if m else content
-
-        try:
-            patches = json.loads(text)
-        except json.JSONDecodeError:
-            # Try extracting from first { to last ]
-            try:
-                start = text.index("[")
-                end = text.rindex("]") + 1
-                patches = json.loads(text[start:end])
-            except (ValueError, json.JSONDecodeError):
-                return []
-
+        from core.json_utils import extract_json_array
+        patches = extract_json_array(content)
         if not isinstance(patches, list):
             return []
 

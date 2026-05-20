@@ -70,9 +70,8 @@ class Summarizer:
         return response.content.strip()
 
     def _parse_json(self, content: str) -> dict:
-        try:
-            start = content.index("{")
-            end = content.rindex("}") + 1
-            return json.loads(content[start:end])
-        except (ValueError, json.JSONDecodeError):
-            return {"summary": content[:200], "key_events": [], "entity_state_changes": [], "new_hooks": [], "resolved_hooks": []}
+        from core.json_utils import extract_json_block
+        result = extract_json_block(content)
+        if result is not None:
+            return result
+        return {"summary": content[:200], "key_events": [], "entity_state_changes": [], "new_hooks": [], "resolved_hooks": []}

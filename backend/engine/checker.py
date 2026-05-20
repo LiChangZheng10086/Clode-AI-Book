@@ -373,13 +373,12 @@ class ChapterReviewer:
             return self._error_report(str(exc))
 
     def _parse_response(self, content: str) -> dict:
-        try:
-            start = content.index("{")
-            end = content.rindex("}") + 1
-            return json.loads(content[start:end])
-        except (ValueError, json.JSONDecodeError):
-            logger.warning("Failed to parse A7 response JSON (len=%s)", len(content))
-            return self._error_report(content[:500])
+        from core.json_utils import extract_json_block
+        result = extract_json_block(content)
+        if result is not None:
+            return result
+        logger.warning("Failed to parse A7 response JSON (len=%s)", len(content))
+        return self._error_report(content[:500])
 
     def _error_report(self, detail: str) -> dict:
         return {
