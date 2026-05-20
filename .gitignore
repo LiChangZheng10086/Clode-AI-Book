@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.env
+*.egg-info/
+dist/
+node_modules/
+.venv/
+venv/
+migrations/versions/*.pyc
+
+# IDE
+.idea/
+backend/.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+backend/logs/
+
+# Claude local config
+.claude/settings.local.json
