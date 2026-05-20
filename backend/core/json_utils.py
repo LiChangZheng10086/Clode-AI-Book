@@ -184,3 +184,59 @@ def extract_json_array(content: str) -> list | None:
         except json.JSONDecodeError:
             pass
     return best
+
+
+def parse_llm_json(content: str, fallback_key: str | None = None) -> dict:
+    """Extract a JSON object from LLM output with logging and structured fallback.
+
+    Uses the multi-strategy ``extract_json_block`` and returns a dict on failure
+    instead of ``None``, so callers never receive a raw None.
+
+    Args:
+        content: Raw LLM response text.
+        fallback_key: If set and extraction fails, returns
+            ``{"status": "complete", fallback_key: {"raw": content}}``.
+            If None, returns ``{"status": "error", "raw": content[:500]}``.
+
+    Returns:
+        Parsed JSON dict, or a structured fallback dict (never None).
+    """
+    if not content:
+        logger.warning("parse_llm_json received empty content")
+        return {"status": "error", "raw": ""}
+
+    result = extract_json_block(content)
+    if result is not None:
+        return result
+
+    logger.warning(
+        "Failed to extract JSON from LLM response (len=%d, fallback_key=%s)",
+        len(content), fallback_key,
+    )
+    if fallback_key:
+        return {"status": "complete", fallback_key: {"raw": content}}
+    return {"status": "error", "raw": content[:500]}
+
+
+def parse_llm_json_array(content: str) -> list:
+    """Extract a JSON array from LLM output with logging and safe fallback.
+
+    Uses the multi-strategy ``extract_json_array`` and returns an empty list
+    on failure instead of ``None``.
+
+    Returns:
+        Parsed JSON list, or ``[]`` on failure (never None).
+    """
+    if not content:
+        logger.warning("parse_llm_json_array received empty content")
+        return []
+
+    result = extract_json_array(content)
+    if result is not None:
+        return result
+
+    logger.warning(
+        "Failed to extract JSON array from LLM response (len=%d)",
+        len(content),
+    )
+    return []

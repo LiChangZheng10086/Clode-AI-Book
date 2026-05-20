@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.config import settings
 from core.database import async_session
+from core.json_utils import parse_llm_json, parse_llm_json_array
 from core.llm import get_planning_llm
 from models.base import Chapter, ChapterSummary, Character, EntityState, Hook, Novel, Volume, WorldSetting
 
@@ -561,11 +562,8 @@ async def _extract_hooks(
         )
         response = await llm.ainvoke(prompt)
         text = (response.content or "").strip()
-        from engine.planner import _extract_json
-        result = _extract_json(text)
-        if isinstance(result, list):
-            return [h for h in result if isinstance(h, dict) and h.get("description")]
-        return []
+        result = parse_llm_json_array(text)
+        return [h for h in result if isinstance(h, dict) and h.get("description")]
     except Exception:
         logger.exception("Hook extraction failed")
         # Fallback: save outline hooks as basic hook entries
@@ -625,9 +623,8 @@ async def _extract_entity_states(
         )
         response = await llm.ainvoke(prompt)
         text = (response.content or "").strip()
-        from engine.planner import _extract_json
-        result = _extract_json(text)
-        if isinstance(result, dict):
+        result = parse_llm_json(text)
+        if isinstance(result, dict) and result.get("status") != "error":
             return {k: v for k, v in result.items() if isinstance(v, dict) and v.get("state")}
         return {}
     except Exception:

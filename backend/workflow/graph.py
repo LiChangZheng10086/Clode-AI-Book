@@ -117,8 +117,13 @@ class WriteState(TypedDict):
     review_round: int
     # Context
     context_package: dict | None
+    novel_outline_beat: dict | None
+    # Decision flow control
+    current_agent: str
+    decision_point: dict | None
+    decision_answer: str | None
     # Status
-    status: str
+    status: str  # running | asking | outline_done | writing_done | reviewed | done | error
     error: str | None
 
 
@@ -311,24 +316,111 @@ def build_preprocess_graph() -> StateGraph:
 
 # ── Write Graph ───────────────────────────────────────
 
+# Key-chapter keywords detected in chapter title/summary to flag climax/volume-end
+_CLIMAX_KEYWORDS = ("高潮", "决战", "转折", "结局", "终章", "尾声", "最终战", "大结局", "巅峰", "climax", "final battle")
+
+
+def _is_key_chapter(chapter_index: int, chapter_outline: dict | None, context_package: dict | None) -> bool:
+    """Return True if this chapter warrants mandatory human confirmation before writing.
+
+    Checks (in order):
+    1. Context package marks it explicitly (is_key_chapter or is_volume_end)
+    2. Outline beat has is_climax marker
+    3. Chapter title / summary contains climax keywords
+    4. Every 15 chapters (configurable catch-all for unmarked turning points)
+    """
+    ctx = context_package or {}
+    if ctx.get("is_key_chapter") or ctx.get("is_volume_end"):
+        return True
+
+    outline = chapter_outline or {}
+    if isinstance(outline, dict) and outline.get("is_climax"):
+        return True
+
+    # Check title / summary for climax keywords
+    if isinstance(outline, dict):
+        text = (outline.get("title") or "") + " " + (outline.get("summary") or "")
+        text_lower = text.lower()
+        for kw in _CLIMAX_KEYWORDS:
+            if kw.lower() in text_lower:
+                return True
+
+    # Every 15 chapters unless explicitly opted out
+    if chapter_index > 0 and chapter_index % 15 == 0:
+        return True
+
+    return False
+
+
+def _build_key_chapter_dp(chapter_index: int, outline: dict) -> dict:
+    return {
+        "question": f"第{chapter_index}章是关键章节，请仔细审核大纲后确认继续",
+        "chapter_index": chapter_index,
+        "outline": outline,
+        "options": [
+            {"label": "确认大纲，开始写作", "description": "大纲审阅通过，正常生成正文"},
+            {"label": "重新生成大纲", "description": "让 A5 重新生成章节大纲"},
+        ],
+    }
+
 async def node_chapter_outline(state: WriteState, config: RunnableConfig) -> dict:
-    """A5: Generate chapter-level outline. Skipped if outline already exists."""
+    """A5: Generate chapter-level outline. Pauses for key chapters."""
+    ctx = state.get("context_package", {}) or {}
+
+    # If user is resuming from a decision point, handle their answer
+    if state.get("status") == "running" and state.get("current_agent") == "A5":
+        answer = state.get("decision_answer", "")
+        if answer and "重新生成" in answer:
+            await _emit(config, {"type": "agent_start", "agent": "A5",
+                                 "message": "用户要求重新生成大纲..."})
+            outliner = ChapterOutliner()
+            result = await outliner.generate(
+                chapter_index=state["chapter_index"],
+                novel_outline_beat=state.get("novel_outline_beat", {}),
+                context_package=ctx,
+            )
+            outline = result.get("chapter_outline", result)
+            await _emit(config, {"type": "agent_complete", "agent": "A5", "data": outline})
+            # Re-check: newly generated outline for this key chapter also needs confirmation
+            if _is_key_chapter(state["chapter_index"], outline, ctx):
+                dp = _build_key_chapter_dp(state["chapter_index"], outline)
+                await _emit(config, {"type": "decision_point", "agent": "A5", "data": dp})
+                return {"chapter_outline": outline, "status": "asking",
+                        "current_agent": "A5", "decision_point": dp, "decision_answer": None}
+            return {"chapter_outline": outline, "status": "outline_done",
+                    "current_agent": "A6", "decision_answer": None}
+        elif answer:
+            # User confirmed — proceed with existing outline
+            outline = state.get("chapter_outline", {})
+            await _emit(config, {"type": "agent_complete", "agent": "A5", "data": outline,
+                                 "message": "用户已确认大纲"})
+            return {"chapter_outline": outline, "status": "outline_done",
+                    "current_agent": "A6", "decision_answer": None}
+
+    # Load existing outline or generate new one
     existing = state.get("chapter_outline")
     if existing and isinstance(existing, dict) and existing.get("scenes"):
-        await _emit(config, {"type": "agent_complete", "agent": "A5", "data": existing, "message": "跳过（大纲已存在）"})
-        return {"status": "outline_done"}
+        outline = existing
+    else:
+        await _emit(config, {"type": "agent_start", "agent": "A5", "message": "正在生成章节大纲..."})
+        outliner = ChapterOutliner()
+        result = await outliner.generate(
+            chapter_index=state["chapter_index"],
+            novel_outline_beat=state.get("novel_outline_beat", {}),
+            context_package=ctx,
+        )
+        outline = result.get("chapter_outline", result)
 
-    await _emit(config, {"type": "agent_start", "agent": "A5", "message": "正在生成章节大纲..."})
-
-    outliner = ChapterOutliner()
-    result = await outliner.generate(
-        chapter_index=state["chapter_index"],
-        novel_outline_beat=state.get("novel_outline_beat", {}),
-        context_package=state.get("context_package", {}),
-    )
-    outline = result.get("chapter_outline", result)
     await _emit(config, {"type": "agent_complete", "agent": "A5", "data": outline})
-    return {"chapter_outline": outline, "status": "outline_done"}
+
+    # Check if this is a key chapter requiring human confirmation
+    if _is_key_chapter(state["chapter_index"], outline, ctx):
+        dp = _build_key_chapter_dp(state["chapter_index"], outline)
+        await _emit(config, {"type": "decision_point", "agent": "A5", "data": dp})
+        return {"chapter_outline": outline, "status": "asking",
+                "current_agent": "A5", "decision_point": dp}
+
+    return {"chapter_outline": outline, "status": "outline_done", "current_agent": "A6"}
 
 
 async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
@@ -563,6 +655,15 @@ async def node_update_memory(state: WriteState, config: RunnableConfig) -> dict:
 
 # ── Write Routing ─────────────────────────────────────
 
+def route_after_outline(state: WriteState) -> str:
+    """After A5: pause if asking, proceed to A6 if outline confirmed, else re-enter A5."""
+    if state.get("status") == "asking":
+        return END
+    if state.get("status") == "outline_done":
+        return "A6"
+    return "A5"  # Resume: re-enter to process decision_answer
+
+
 def route_after_review(state: WriteState) -> str:
     report = state.get("review_report", {})
     overall = report.get("overall", "revision_needed")
@@ -585,7 +686,7 @@ def build_write_graph() -> StateGraph:
     graph.add_node("update_memory", node_update_memory)
 
     graph.set_entry_point("A5")
-    graph.add_edge("A5", "A6")
+    graph.add_conditional_edges("A5", route_after_outline, {"A5": "A5", "A6": "A6", END: END})
     graph.add_edge("A6", "A7")
     graph.add_conditional_edges("A7", route_after_review, {"A6": "A6", "update_memory": "update_memory"})
     graph.add_edge("update_memory", END)
@@ -696,18 +797,33 @@ class WorkflowManager:
             "novel_id": novel_id,
             "chapter_id": chapter_id,
             "chapter_index": chapter_index,
-            # Use existing outline if provided (revision or confirmed outline)
             "chapter_outline": novel_outline_beat if has_outline else None,
             "chapter_content": None,
             "polished_content": existing_content,
             "review_report": None,
             "review_round": 0,
             "context_package": context_package,
+            "novel_outline_beat": novel_outline_beat if has_outline else None,
+            "current_agent": "A5",
+            "decision_point": None,
+            "decision_answer": None,
             "status": "running",
             "error": None,
         }
         config = {"configurable": {"thread_id": f"write_{chapter_id}"}}
         async for event in _stream_graph(self.write_graph, initial, config):
+            yield event
+
+    async def resume_write(
+        self, novel_id: str, chapter_id: str, decision_answer: str
+    ) -> AsyncIterator[dict]:
+        """Resume write after user answers a decision point."""
+        config = {"configurable": {"thread_id": f"write_{chapter_id}"}}
+        async for event in _stream_graph(
+            self.write_graph,
+            {"decision_answer": decision_answer, "status": "running"},
+            config,
+        ):
             yield event
 
 

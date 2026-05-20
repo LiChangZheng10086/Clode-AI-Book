@@ -7,7 +7,7 @@ from typing import AsyncIterator
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from core.json_utils import repair_json, repair_truncated, extract_json_block
+from core.json_utils import extract_json_block, parse_llm_json
 from core.llm import get_planning_llm
 
 logger = logging.getLogger(__name__)
@@ -18,19 +18,14 @@ _SKIP_ASKING_HINT = (
     "不要生成 status: \"asking\" 的决策点。"
 )
 
-# Backward-compatible aliases for modules importing from planner
-_repair_json = repair_json
-_repair_truncated = repair_truncated
+# Backward-compatible aliases for modules that still import from planner.
+# New code should import directly from core.json_utils.
 _extract_json = extract_json_block
 
 
 def _parse_llm_response(content: str, fallback_key: str) -> dict:
-    """Parse LLM response, returning a dict with fallback on failure."""
-    result = _extract_json(content)
-    if result is not None:
-        return result
-    logger.warning("Failed to extract JSON from LLM response (len=%s, fallback_key=%s)", len(content), fallback_key)
-    return {"status": "complete", fallback_key: {"raw": content}}
+    """Parse LLM response, returning a dict with structured fallback on failure."""
+    return parse_llm_json(content, fallback_key=fallback_key)
 
 
 class WorldbuildingAgent:

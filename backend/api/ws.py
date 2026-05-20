@@ -466,6 +466,7 @@ async def write_ws(websocket: WebSocket, novel_id: str):
                 })
 
                 try:
+                    last_state: dict = {}
                     async for event in workflow_manager.run_write(
                         novel_id, chapter_id, chapter_index,
                         novel_outline_beat, context_package,
@@ -473,6 +474,17 @@ async def write_ws(websocket: WebSocket, novel_id: str):
                         await websocket.send_json(event)
 
                         state = event.get("state", {}) or {}
+                        if state:
+                            last_state = state
+
+                        # decision_point emitted directly from graph nodes (e.g., A5)
+                        if event.get("type") == "decision_point":
+                            await websocket.send_json({
+                                "type": "decision_point",
+                                "agent": event.get("agent", "A5"),
+                                "data": event.get("data"),
+                            })
+
                         if state.get("status") == "done":
                             report = state.get("review_report", {})
                             if report.get("overall") == "pass":
@@ -502,8 +514,82 @@ async def write_ws(websocket: WebSocket, novel_id: str):
                                     "data": report,
                                 })
 
+                    # After graph stream ends, check if it paused on a decision point
+                    if last_state.get("status") == "asking":
+                        dp = last_state.get("decision_point")
+                        await websocket.send_json({
+                            "type": "decision_point",
+                            "agent": last_state.get("current_agent", "A5"),
+                            "data": dp or {},
+                            "message": "关键章节 — 等待人工确认大纲",
+                        })
+                        logger.info("Write paused at decision point, chapter=%s", chapter_index)
+
                 except Exception as e:
                     logger.exception("Write pipeline error")
+                    await websocket.send_json({"type": "error", "message": str(e)})
+
+            elif action == "decide":
+                answer = msg.get("answer", "")
+                chapter_id = msg.get("chapter_id", "")
+                logger.info("Write WS decide: answer=%s chapter_id=%s", answer, chapter_id)
+                try:
+                    last_state: dict = {}
+                    async for event in workflow_manager.resume_write(
+                        novel_id, chapter_id, answer,
+                    ):
+                        await websocket.send_json(event)
+
+                        state = event.get("state", {}) or {}
+                        if state:
+                            last_state = state
+
+                        if event.get("type") == "decision_point":
+                            await websocket.send_json({
+                                "type": "decision_point",
+                                "agent": event.get("agent", "A5"),
+                                "data": event.get("data"),
+                            })
+
+                        if state.get("status") == "done":
+                            report = state.get("review_report", {})
+                            if report.get("overall") == "pass":
+                                await websocket.send_json({
+                                    "type": "pipeline_complete",
+                                    "message": "本章通过审核",
+                                    "data": {
+                                        "polished_content": state.get("polished_content"),
+                                        "review_report": report,
+                                    },
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "pipeline_stuck",
+                                    "message": "审核3轮仍未通过，已挂起等待人工处理",
+                                    "data": {
+                                        "polished_content": state.get("polished_content"),
+                                        "review_report": report,
+                                    },
+                                })
+                        elif state.get("status") == "reviewed":
+                            report = state.get("review_report", {})
+                            if report.get("overall") != "pass" and state.get("review_round", 0) < 3:
+                                await websocket.send_json({
+                                    "type": "review_retry",
+                                    "message": f"审核未通过，第{state.get('review_round')}轮修改",
+                                    "data": report,
+                                })
+
+                    if last_state.get("status") == "asking":
+                        dp = last_state.get("decision_point")
+                        await websocket.send_json({
+                            "type": "decision_point",
+                            "agent": last_state.get("current_agent", "A5"),
+                            "data": dp or {},
+                        })
+
+                except Exception as e:
+                    logger.exception("Write resume error")
                     await websocket.send_json({"type": "error", "message": str(e)})
 
             elif action == "confirm_manual":

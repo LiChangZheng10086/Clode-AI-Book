@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import async_session
+from core.json_utils import parse_llm_json_array
 from core.llm import get_planning_llm
 from models.base import Character
 
@@ -75,13 +76,7 @@ async def extract_and_save_new_characters(
     try:
         response = await llm.ainvoke(prompt)
         text = (response.content or "").strip()
-        # Extract JSON array
-        from engine.planner import _extract_json
-        result = _extract_json(text)
-        if isinstance(result, dict):
-            result = list(result.values()) if result else []
-        if not isinstance(result, list):
-            result = []
+        result = parse_llm_json_array(text)
     except Exception as exc:
         logger.warning("Character extraction LLM call failed: %s", exc)
         return []

@@ -34,6 +34,7 @@ export default function Write() {
   const [streamText, setStreamText] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
+  const [writeDecision, setWriteDecision] = useState<any>(null);
 
   // Context data for the sidebar
   const [context, setContext] = useState<{
@@ -149,6 +150,15 @@ export default function Write() {
         setTab("review");
         break;
 
+      case "decision_point":
+        console.log("[Write] Decision point received:", msg);
+        setWriteDecision({ ...msg.data, agent: msg.agent });
+        setStatus("idle");
+        if (msg.data?.outline) {
+          setOutline(msg.data.outline);
+        }
+        break;
+
       case "error":
         console.error("Write WS error:", msg.message);
         break;
@@ -209,6 +219,22 @@ export default function Write() {
     }
   };
 
+  const answerDecision = (choice: string) => {
+    const answer = typeof choice === "string" ? choice : JSON.stringify(choice);
+    send({
+      action: "decide",
+      chapter_id: `${id}_ch${chapterIndex}`,
+      answer,
+    });
+    setWriteDecision(null);
+    if (choice.includes("确认")) {
+      setStatus("writing");
+    } else if (choice.includes("重新生成")) {
+      setOutline(null);
+      setStatus("outlining");
+    }
+  };
+
   const nextChapter = () => {
     setChapterIndex((c) => c + 1);
     setOutline(null);
@@ -218,6 +244,7 @@ export default function Write() {
     setStreamText("");
     setStatus("idle");
     setTab("outline");
+    setWriteDecision(null);
   };
 
   return (
@@ -366,7 +393,15 @@ export default function Write() {
         <div className="flex-1 p-6 overflow-y-auto">
           {tab === "outline" && (
             <div>
-              {outline ? (
+              {writeDecision ? (
+                <div>
+                  <WriteDecisionView
+                    dp={writeDecision}
+                    outline={outline}
+                    onChoose={answerDecision}
+                  />
+                </div>
+              ) : outline ? (
                 <div>
                   <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
                     <pre className="text-sm text-slate-400 whitespace-pre-wrap font-sans">
@@ -593,5 +628,62 @@ function CollapsibleSection({
       </summary>
       <div className="mt-2 ml-2">{children}</div>
     </details>
+  );
+}
+
+function WriteDecisionView({
+  dp,
+  outline,
+  onChoose,
+}: {
+  dp: any;
+  outline: any;
+  onChoose: (choice: string) => void;
+}) {
+  return (
+    <div className="max-w-2xl">
+      <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 mb-4">
+        <h2 className="text-lg font-medium text-amber-300 mb-1">
+          关键章节 — 需要人工确认
+        </h2>
+        <p className="text-sm text-slate-300">{dp.question}</p>
+        {dp.chapter_index && (
+          <p className="text-xs text-slate-500 mt-1">第 {dp.chapter_index} 章</p>
+        )}
+      </div>
+
+      {/* Show the outline for review */}
+      {outline && (
+        <div className="mb-4">
+          <h3 className="text-sm font-medium text-slate-400 mb-2">章节大纲预览</h3>
+          <div className="bg-slate-800 border border-slate-700 rounded-lg p-4 max-h-[40vh] overflow-y-auto">
+            <pre className="text-xs text-slate-400 whitespace-pre-wrap font-sans">
+              {JSON.stringify(outline, null, 2)}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      <div className="flex flex-col gap-2">
+        {dp.options?.map((opt: any) => (
+          <button
+            key={opt.label}
+            onClick={() => onChoose(opt.label)}
+            className={`text-left p-4 bg-slate-800 border rounded-lg transition-colors ${
+              opt.label.includes("确认")
+                ? "border-indigo-500 hover:border-indigo-400"
+                : "border-slate-700 hover:border-slate-600"
+            }`}
+          >
+            <div className="text-sm font-medium text-slate-200">{opt.label}</div>
+            <div className="text-xs text-slate-400 mt-1">{opt.description}</div>
+          </button>
+        ))}
+      </div>
+
+      <p className="mt-4 text-xs text-slate-500">
+        这是关键剧情节点，建议仔细审核大纲中的场景安排、角色动机和伏笔处理后再确认。
+      </p>
+    </div>
   );
 }

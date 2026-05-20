@@ -1,12 +1,16 @@
 """A5-A6 Writing agents: Chapter Outliner and Chapter Writer."""
 
 import json
+import logging
 from typing import AsyncIterator
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from core.json_utils import parse_llm_json, parse_llm_json_array
 from core.llm import get_llm, get_planning_llm
+
+logger = logging.getLogger(__name__)
 
 
 class ChapterOutliner:
@@ -103,11 +107,7 @@ class ChapterOutliner:
                 yield {"type": "stream", "content": chunk.content}
 
     def _parse_response(self, content: str) -> dict:
-        from engine.planner import _extract_json
-        result = _extract_json(content)
-        if result is not None:
-            return result
-        return {"chapter_outline": {"raw": content}}
+        return parse_llm_json(content, fallback_key="chapter_outline")
 
 
 class ChapterWriter:
@@ -275,26 +275,20 @@ class ChapterWriter:
             response = await self.llm.ainvoke([SystemMessage(content=prompt)])
             return self._parse_patches((response.content or ""))
         except Exception:
-            logger = __import__("logging").getLogger(__name__)
             logger.exception("A6 _generate_patches failed")
             return []
 
     def _parse_patches(self, content: str) -> list[dict]:
-        """Extract JSON patch array from LLM response."""
-        if not content:
+        patches = parse_llm_json_array(content)
+        if not patches:
             return []
-
-        from core.json_utils import extract_json_array
-        patches = extract_json_array(content)
-        if not isinstance(patches, list):
-            return []
-
-        # Validate each patch
         valid = []
         for p in patches:
             if isinstance(p, dict) and p.get("target") and isinstance(p["target"], str):
                 p["replacement"] = p.get("replacement", "")
                 valid.append(p)
+        if not valid and patches:
+            logger.warning("No valid patches found in A6 patch array (got %d items)", len(patches))
         return valid
 
     def _apply_patches(self, original: str, patches: list[dict]) -> str:
@@ -325,7 +319,6 @@ class ChapterWriter:
                 else:
                     skipped += 1
 
-        logger = __import__("logging").getLogger(__name__)
         logger.info(
             "A6 revise: applied %d patches, skipped %d (out of %d)",
             applied, skipped, len(patches),

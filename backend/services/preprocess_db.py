@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import async_session
+from core.json_utils import extract_json_block
 from models.base import Character, Chapter, Novel, StyleProfile, Volume, WorldSetting
 
 logger = logging.getLogger(__name__)
@@ -212,9 +213,7 @@ def _looks_like_character(d: dict) -> bool:
 
 
 def _try_parse_raw_json(raw_text: str) -> dict | None:
-    """Try to extract JSON from a raw LLM response. Delegates to planner._extract_json."""
-    from engine.planner import _extract_json
-    return _extract_json(raw_text)
+    return extract_json_block(raw_text)
 
 
 async def _save_outline(novel_id: UUID, data: dict) -> None:
