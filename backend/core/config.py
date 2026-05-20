@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     planning_model: str = ""
     planning_temperature: float = 0.4
 
+    # Reviewer model (stronger model for quality evaluation; empty = use llm_model)
+    reviewer_model: str = ""
+    reviewer_temperature: float = 0.2
+
     # Polishing model
     polishing_temperature: float = 0.9
 

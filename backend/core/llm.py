@@ -43,5 +43,10 @@ def get_polishing_llm() -> BaseChatModel:
 
 
 def get_reviewer_llm() -> BaseChatModel:
-    """Get LLM for chapter review (low temperature for precision)."""
-    return get_llm(temperature=0.2)
+    """Get LLM for chapter review (optionally uses a stronger model)."""
+    model = settings.reviewer_model or settings.llm_model
+    return _create_chatopenai(
+        temperature=settings.reviewer_temperature,
+        max_tokens=settings.llm_max_tokens,
+        model=model,
+    )

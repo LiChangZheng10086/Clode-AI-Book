@@ -402,19 +402,27 @@ async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
 
 
 async def node_chapter_review(state: WriteState, config: RunnableConfig) -> dict:
-    """A7: Review chapter content."""
+    """A7: Review chapter content (two-stage)."""
     round_num = state.get("review_round", 0) + 1
     await _emit(config, {"type": "agent_start", "agent": "A7", "message": f"正在审核 (第{round_num}轮)..."})
+
+    ctx = state.get("context_package", {}) or {}
+
+    # Map context_package fields → reviewer parameters
+    # _load_write_context stores world as world_setting_chunks list and chars as character_voices
+    world_chunks = ctx.get("world_setting_chunks", [])
+    world_setting = world_chunks[0] if isinstance(world_chunks, list) and world_chunks else {}
+    characters = ctx.get("character_voices", [])
 
     reviewer = ChapterReviewer()
     report = await reviewer.review(
         chapter_content=state.get("polished_content", state.get("chapter_content", "")),
         chapter_outline=state.get("chapter_outline", {}),
-        world_setting=state.get("context_package", {}).get("world_setting", {}),
-        characters=state.get("context_package", {}).get("characters", []),
-        style_profile=state.get("context_package", {}).get("style_profile", {}),
-        hooks=state.get("context_package", {}).get("pending_hooks", []),
-        prev_chapter_summaries=state.get("context_package", {}).get("recent_summaries", []),
+        world_setting=world_setting,
+        characters=characters,
+        style_profile=ctx.get("style_profile", {}),
+        hooks=ctx.get("pending_hooks", []),
+        prev_chapter_summaries=ctx.get("recent_summaries", []),
     )
 
     await _emit(config, {"type": "review_report", "agent": "A7", "data": report})
