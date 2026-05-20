@@ -7,9 +7,10 @@ from uuid import UUID
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import settings
 from core.database import async_session
 from core.llm import get_planning_llm
-from models.base import Chapter, ChapterSummary, EntityState, Hook, Novel, Volume
+from models.base import Chapter, ChapterSummary, Character, EntityState, Hook, Novel, Volume, WorldSetting
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,23 @@ _BOOK_SUMMARY_PROMPT = """你是一位小说编辑。请根据已完成的章节
 2. 主要剧情进展
 3. 关键转折点
 
+只输出摘要文本，不要任何标记或格式。"""
+
+_BOOK_SUMMARY_FULL_PROMPT = """你是一位小说编辑。请根据全部已完成章节的摘要，重新撰写一份完整、准确的全书摘要。
+
+已有全书摘要（供参考，可能有偏差）：
+{existing_summary}
+
+所有章节摘要（按章节顺序）：
+{all_summaries}
+
+请撰写一份全面的全书摘要（300–500 字），涵盖：
+1. 故事的整体走向和主题
+2. 主要剧情线和关键转折点
+3. 重要角色发展弧线
+4. 当前未解决的主要悬念
+
+这次是全面重构而非增量更新，请基于所有章节摘要从零构建，修正增量累积的偏差。
 只输出摘要文本，不要任何标记或格式。"""
 
 _VOLUME_SUMMARY_PROMPT = """你是一位小说编辑。请为当前卷撰写一段摘要（150–300 字）。
@@ -161,12 +179,24 @@ async def run_memory_updates(
             result["chapter_summary"] = chapter_summary_text
             logger.info("Generated chapter summary for ch %s", chapter_index)
 
-        # 2. Update book-level summary
+        # 2. Update book-level summary — with periodic full recompute
         existing_book_summary = await _get_latest_summary(db, novel_uuid, "book")
         all_chapter_summaries = await _get_all_chapter_summaries(db, novel_uuid)
-        book_summary = await _generate_book_summary(
-            existing_book_summary, chapter_summary_text or "", all_chapter_summaries
-        )
+        interval = getattr(settings, "book_summary_recompute_interval", 5)
+        do_full_recompute = chapter_index > 1 and chapter_index % interval == 0
+
+        if do_full_recompute:
+            # Include the current (uncommitted) chapter summary in the full recompute
+            all_summaries_for_recompute = list(all_chapter_summaries)
+            if chapter_summary_text:
+                all_summaries_for_recompute.append(chapter_summary_text)
+            book_summary = await _generate_book_summary_full(
+                existing_book_summary, all_summaries_for_recompute
+            )
+        else:
+            book_summary = await _generate_book_summary(
+                existing_book_summary, chapter_summary_text or "", all_chapter_summaries
+            )
         if book_summary:
             await db.execute(
                 delete(ChapterSummary).where(
@@ -280,6 +310,54 @@ async def run_memory_updates(
                     ))
             result["entity_states_updated"] = len(entity_states)
             logger.info("Updated %d entity states for ch %s", len(entity_states), chapter_index)
+
+        # 6. Periodic consistency check (same interval as full recompute)
+        if do_full_recompute:
+            try:
+                from engine.consistency import ConsistencyChecker
+
+                ws_result = await db.execute(
+                    select(WorldSetting).where(WorldSetting.novel_id == novel_uuid)
+                )
+                ws = ws_result.scalar_one_or_none()
+                world_setting = ws.settings if ws else {}
+
+                char_result = await db.execute(
+                    select(Character).where(Character.novel_id == novel_uuid)
+                )
+                characters = [
+                    {"name": c.name, "role": c.role, "voice": c.voice_config}
+                    for c in char_result.scalars().all()
+                ]
+
+                hook_result = await db.execute(
+                    select(Hook).where(
+                        Hook.novel_id == novel_uuid,
+                        Hook.status.in_(["unresolved", "in_progress"]),
+                    )
+                )
+                pending_hooks = [
+                    {"description": h.description, "type": h.hook_type, "priority": h.priority}
+                    for h in hook_result.scalars().all()
+                ]
+
+                checker = ConsistencyChecker()
+                consistency_result = await checker.check(
+                    chapter_summaries=all_chapter_summaries,
+                    world_setting=world_setting,
+                    characters=characters,
+                    pending_hooks=pending_hooks,
+                )
+                result["consistency_check"] = consistency_result
+                if consistency_result.get("issues"):
+                    logger.info(
+                        "Consistency check found %d issues (score=%s) for novel %s ch %s",
+                        len(consistency_result["issues"]),
+                        consistency_result.get("score"),
+                        novel_id, chapter_index,
+                    )
+            except Exception:
+                logger.exception("Consistency check failed")
 
         await db.commit()
 
@@ -400,6 +478,26 @@ async def _generate_book_summary(
         return (response.content or "").strip()
     except Exception:
         logger.exception("Failed to generate book summary")
+        return ""
+
+
+async def _generate_book_summary_full(
+    existing: str, all_summaries: list[str]
+) -> str:
+    """Full book summary recompute from all chapter summaries."""
+    try:
+        summaries_text = "\n".join(
+            f"第{i+1}章: {s[:200]}" for i, s in enumerate(all_summaries)
+        ) if all_summaries else "（尚无章节摘要）"
+        llm = get_planning_llm()
+        prompt = _BOOK_SUMMARY_FULL_PROMPT.format(
+            existing_summary=existing or "（尚无全书摘要）",
+            all_summaries=summaries_text,
+        )
+        response = await llm.ainvoke(prompt)
+        return (response.content or "").strip()
+    except Exception:
+        logger.exception("Failed to generate full book summary recompute")
         return ""
 
 

@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     max_review_rounds: int = 3
     default_chapter_words: int = 3000
 
+    # Book summary full recompute interval (chapters)
+    book_summary_recompute_interval: int = 5
+
     # CORS
     cors_origins: list[str] = ["http://localhost:5173"]
 

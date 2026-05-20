@@ -536,6 +536,25 @@ async def node_update_memory(state: WriteState, config: RunnableConfig) -> dict:
                         "agent": "memory",
                         "message": "；".join(parts),
                     })
+
+                # Emit consistency check results
+                consistency = mem_result.get("consistency_check")
+                if consistency:
+                    issues = consistency.get("issues", [])
+                    score = consistency.get("score", -1)
+                    if issues:
+                        await _emit(config, {
+                            "type": "consistency_report",
+                            "agent": "consistency",
+                            "data": consistency,
+                            "message": f"一致性检查发现 {len(issues)} 个问题（评分: {score}/10）",
+                        })
+                    elif score >= 0:
+                        await _emit(config, {
+                            "type": "progress",
+                            "agent": "consistency",
+                            "message": f"一致性检查通过（评分: {score}/10）",
+                        })
         except Exception:
             logger.exception("Memory updates failed for novel %s ch %s", novel_id, chapter_index)
 
