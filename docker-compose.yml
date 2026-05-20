@@ -19,11 +19,12 @@ services:
     build: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      - ./backend/.env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/clode_ai_book
       DATABASE_SYNC_URL: postgresql+psycopg2://postgres:postgres@db:5432/clode_ai_book
       REDIS_URL: redis://redis:6379/0
-      LLM_API_KEY: ${LLM_API_KEY}
     depends_on:
       - db
       - redis
