@@ -131,8 +131,12 @@ async def run_memory_updates(
     chapter_index: int,
     chapter_content: str,
     chapter_outline: dict | None = None,
+    marker_hooks: dict | None = None,
 ) -> dict:
     """Run all post-chapter memory updates after a chapter passes review.
+
+    If marker_hooks is provided (from hook_process node), it serves as the
+    primary source for hook operations — LLM extraction becomes secondary validation.
 
     Returns a dict summarizing what was updated for frontend display.
     """
@@ -241,42 +245,105 @@ async def run_memory_updates(
                 result["volume_summary"] = vol_summary
                 logger.info("Updated volume summary for vol %s", volume.index)
 
-        # 4. Extract and save hooks
-        hooks_from_outline = _extract_hooks_from_outline(chapter_outline)
-        hooks = await _extract_hooks(chapter_content, hooks_from_outline, novel_uuid, chapter_index)
-        if hooks:
-            for h_data in hooks:
+        # 4. Hook tracking — marker data is primary, LLM extraction is fallback
+        if marker_hooks and any(marker_hooks.get(k) for k in ("new_hooks", "advanced_ids", "resolved_ids")):
+            # Use structured marker data (from hook_process node)
+            new_hooks = marker_hooks.get("new_hooks", [])
+            advanced_ids = marker_hooks.get("advanced_ids", [])
+            resolved_ids = marker_hooks.get("resolved_ids", [])
+
+            # Register new hooks from markers
+            for nh in new_hooks:
                 hook = Hook(
                     novel_id=novel_uuid,
-                    hook_type=h_data.get("hook_type", "mystery"),
-                    description=h_data.get("description", ""),
+                    hook_type=nh.get("hook_type", "mystery"),
+                    description=nh.get("description", ""),
                     planted_chapter_index=chapter_index,
-                    priority=h_data.get("priority", "minor"),
-                    status=h_data.get("status", "unresolved"),
-                    resolution_note=h_data.get("resolution_note"),
-                    resolved_chapter_index=chapter_index if h_data.get("status") == "resolved" else None,
-                    related_entities=h_data.get("related_entities"),
+                    priority=nh.get("priority", "minor"),
+                    status="unresolved",
+                    target_chapter_range=nh.get("target_chapter_range"),
+                    related_entities=nh.get("related_entities"),
                 )
                 db.add(hook)
-            result["new_hooks"] = len(hooks)
-            logger.info("Extracted %d hooks from ch %s", len(hooks), chapter_index)
+            if new_hooks:
+                result["new_hooks"] = len(new_hooks)
+                logger.info("Registered %d hooks from markers for ch %s", len(new_hooks), chapter_index)
 
-        # Mark hooks as resolved if this chapter's outline says so
-        resolved_hook_ids = _find_resolved_hooks(chapter_outline)
-        if resolved_hook_ids:
-            # These are hook identifiers from the outline — try to match existing hooks
-            for hook_name in resolved_hook_ids:
-                stmt = select(Hook).where(
-                    Hook.novel_id == novel_uuid,
-                    Hook.status == "unresolved",
-                )
-                hook_result = await db.execute(stmt)
-                for h in hook_result.scalars().all():
-                    if hook_name.lower() in (h.description or "").lower():
+            # Advance hooks
+            for hid_str in advanced_ids:
+                try:
+                    hid = UUID(hid_str)
+                    hook_result = await db.execute(select(Hook).where(Hook.id == hid))
+                    h = hook_result.scalar_one_or_none()
+                    if h and h.status == "unresolved":
+                        h.status = "in_progress"
+                except (ValueError, Exception):
+                    logger.warning("Failed to advance hook %s", hid_str)
+            if advanced_ids:
+                result["hooks_advanced"] = len(advanced_ids)
+                logger.info("Advanced %d hooks from markers for ch %s", len(advanced_ids), chapter_index)
+
+            # Resolve hooks
+            for hid_str in resolved_ids:
+                try:
+                    hid = UUID(hid_str)
+                    hook_result = await db.execute(select(Hook).where(Hook.id == hid))
+                    h = hook_result.scalar_one_or_none()
+                    if h:
                         h.status = "resolved"
                         h.resolved_chapter_index = chapter_index
-                        h.resolution_note = f"第{chapter_index}章回收"
-                        logger.info("Resolved hook %s in ch %s", h.id, chapter_index)
+                        h.resolution_note = f"第{chapter_index}章回收（标注）"
+                except (ValueError, Exception):
+                    logger.warning("Failed to resolve hook %s", hid_str)
+            if resolved_ids:
+                result["hooks_resolved"] = len(resolved_ids)
+                logger.info("Resolved %d hooks from markers for ch %s", len(resolved_ids), chapter_index)
+
+            # Secondary: run LLM extraction as cross-validation
+            hooks_from_outline = _extract_hooks_from_outline(chapter_outline)
+            llm_hooks = await _extract_hooks(chapter_content, hooks_from_outline, novel_uuid, chapter_index)
+            llm_new = sum(1 for h in llm_hooks if h.get("status") != "resolved")
+            if llm_new > len(new_hooks):
+                logger.info(
+                    "LLM found %d new hooks vs %d from markers for ch %s — possible missed markers",
+                    llm_new, len(new_hooks), chapter_index,
+                )
+        else:
+            # No marker data — fall back to LLM extraction
+            hooks_from_outline = _extract_hooks_from_outline(chapter_outline)
+            hooks = await _extract_hooks(chapter_content, hooks_from_outline, novel_uuid, chapter_index)
+            if hooks:
+                for h_data in hooks:
+                    hook = Hook(
+                        novel_id=novel_uuid,
+                        hook_type=h_data.get("hook_type", "mystery"),
+                        description=h_data.get("description", ""),
+                        planted_chapter_index=chapter_index,
+                        priority=h_data.get("priority", "minor"),
+                        status=h_data.get("status", "unresolved"),
+                        resolution_note=h_data.get("resolution_note"),
+                        resolved_chapter_index=chapter_index if h_data.get("status") == "resolved" else None,
+                        related_entities=h_data.get("related_entities"),
+                    )
+                    db.add(hook)
+                result["new_hooks"] = len(hooks)
+                logger.info("Extracted %d hooks from LLM for ch %s", len(hooks), chapter_index)
+
+            # Mark hooks as resolved from outline hints (LLM fallback only)
+            resolved_hook_ids = _find_resolved_hooks(chapter_outline)
+            if resolved_hook_ids:
+                for hook_name in resolved_hook_ids:
+                    stmt = select(Hook).where(
+                        Hook.novel_id == novel_uuid,
+                        Hook.status == "unresolved",
+                    )
+                    hook_result = await db.execute(stmt)
+                    for h in hook_result.scalars().all():
+                        if hook_name.lower() in (h.description or "").lower():
+                            h.status = "resolved"
+                            h.resolved_chapter_index = chapter_index
+                            h.resolution_note = f"第{chapter_index}章回收"
+                            logger.info("Resolved hook %s in ch %s", h.id, chapter_index)
 
         # 5. Update entity states
         known_entities = await _get_known_entities(db, novel_uuid)
@@ -312,7 +379,31 @@ async def run_memory_updates(
             result["entity_states_updated"] = len(entity_states)
             logger.info("Updated %d entity states for ch %s", len(entity_states), chapter_index)
 
-        # 6. Periodic consistency check + style recalibration
+        # 6. Periodic hook audit (every N chapters)
+        if do_full_recompute:
+            try:
+                registry = HookRegistry(db)
+                audit = await registry.audit_hooks(novel_uuid, chapter_index)
+                result["hook_audit"] = audit
+                health = audit.get("health_score", 100)
+                if health < 80:
+                    logger.warning(
+                        "Hook health low for novel %s at ch %s: score=%d, overdue=%d, stale=%d",
+                        novel_id, chapter_index, health,
+                        len(audit.get("overdue", [])),
+                        len(audit.get("stale", [])),
+                    )
+                logger.info(
+                    "Hook audit for novel %s ch %s: score=%d, pending=%d, overdue=%d, stale=%d",
+                    novel_id, chapter_index, health,
+                    audit.get("total_pending", 0),
+                    len(audit.get("overdue", [])),
+                    len(audit.get("stale", [])),
+                )
+            except Exception:
+                logger.exception("Hook audit failed")
+
+        # 7. Periodic consistency check + style recalibration
         if do_full_recompute:
             try:
                 from engine.consistency import ConsistencyChecker

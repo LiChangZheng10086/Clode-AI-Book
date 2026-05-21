@@ -39,6 +39,11 @@ class ChapterOutliner:
     "target_word_count": 3500,
     "prev_chapter_link": "紧接上一章...",
     "next_chapter_hook": "读者继续翻页的理由...",
+    "hook_actions": [
+      {"action": "plant", "hook_id": null, "description": "新伏笔简述", "priority": "major"},
+      {"action": "advance", "hook_id": "hook_042", "description": "推进了古戒的异常反应"},
+      {"action": "resolve", "hook_id": "hook_038", "description": "回收了林凡突破筑基的伏笔"}
+    ],
     "scenes": [
       {
         "scene": 1,
@@ -60,7 +65,8 @@ class ChapterOutliner:
 1. 场景之间有因果链，不是简单时间顺序
 2. 情绪有起伏，不要平铺
 3. 每个场景都要推进剧情、揭示信息、或深化角色
-4. 钩子的推进和回收要明确标注"""
+4. 钩子的推进和回收要明确标注
+5. hook_actions 汇总本章所有钩子操作，与 scenes 中的 hook_plant/hook_advanced 保持一致"""
 
     def __init__(self, llm: BaseChatModel | None = None):
         self.llm = llm or get_planning_llm()
@@ -161,9 +167,27 @@ class ChapterWriter:
 【第五步：草稿自审】
 全文写完后，再次对照节拍清单逐项检查，如有遗漏，在对应位置补写。
 
+【第六步：钩子操作标注（强制）】
+正文写完后，在文中你进行了钩子操作的位置，**必须插入标注标记**：
+- 埋设新伏笔 → <hook action="plant" note="伏笔简述（15字以内）" priority="major|minor"/>
+- 推进已有伏笔 → <hook action="advance" id="hook_xxx" note="本次推进了什么"/>
+- 回收/解决伏笔 → <hook action="resolve" id="hook_xxx" note="回收方式"/>
+
+示例：
+  林凡听到窗外传来一声轻响。<hook action="plant" note="神秘人暗中监视林凡" priority="major"/>
+  古戒微微发热——林凡知道，这是传承开始的信号。<hook action="advance" id="hook_042" note="古戒异常发热，传承即将开启"/>
+  光芒散去，古戒终于安静下来，仿佛从未发生过任何事。<hook action="resolve" id="hook_042" note="古戒认主完成，传承结束"/>
+
+规则：
+- 标记插入在钩子事件发生的句子之后
+- 每个钩子操作只标注一次
+- 必须标注的 id 来自上下文包中"待推进/回收的伏笔"列表
+- 新埋的伏笔不需要 id（系统会自动分配），但必须写 priority 和 note
+- 如果本章没有任何钩子操作，可以不插入标记
+
 ==== 输出格式 ====
-直接输出章节正文。不需要任何前言、标记或 JSON 包装。
-正文完成后润色器会自动处理表达层面的优化。"""
+直接输出章节正文（含钩子标记）。不需要任何前言、JSON 包装。
+钩子标记会在后续流程中被自动解析和移除，最终读者不会看到它们。"""
 
     PATCH_PROMPT = """你是一位精准修改师。你的任务是根据审核报告，对原文进行**最小粒度的精确修改**。
 
@@ -243,10 +267,13 @@ class ChapterWriter:
         vol_summary = context_package.get("volume_summary", "无")
         parts.append(f"当前卷概要：{vol_summary}")
 
-        # ── 5. Hook tracking ──
+        # ── 5. Hook tracking (pruned to avoid token bloat) ──
         pending_hooks = context_package.get("pending_hooks", [])
         if pending_hooks:
-            parts.append(f"待推进/回收的伏笔（必须在写作中推进或回收）：\n{json.dumps(pending_hooks, ensure_ascii=False, indent=2)}")
+            pruned = self._prune_pending_hooks(pending_hooks)
+            parts.append(f"待推进/回收的伏笔（必须在写作中推进或回收）：\n{json.dumps(pruned, ensure_ascii=False, indent=2)}")
+            if len(pending_hooks) > len(pruned):
+                parts.append(f"（另有 {len(pending_hooks) - len(pruned)} 个次要伏笔未列出，如涉及可自行处理）")
 
         # ── 6. Entity state ──
         entity_states = context_package.get("entity_states", {})
@@ -271,6 +298,26 @@ class ChapterWriter:
         return "\n\n".join(parts) + "\n\n请严格按照【写作结构】中的五步流程撰写本章正文。"
 
     # ── Structured section builders ──────────────────────────
+
+    _MAX_PENDING_HOOKS_IN_PROMPT = 15
+
+    @staticmethod
+    def _prune_pending_hooks(hooks: list[dict]) -> list[dict]:
+        """Limit pending hooks to avoid token bloat and attention dilution.
+
+        Sorts by priority (major first) then recency (higher chapter index first),
+        and keeps at most _MAX_PENDING_HOOKS_IN_PROMPT.
+        """
+        if len(hooks) <= ChapterWriter._MAX_PENDING_HOOKS_IN_PROMPT:
+            return hooks
+        sorted_hooks = sorted(
+            hooks,
+            key=lambda h: (
+                0 if h.get("priority") == "major" else 1,
+                -(h.get("planted_chapter_index") or 0),
+            ),
+        )
+        return sorted_hooks[:ChapterWriter._MAX_PENDING_HOOKS_IN_PROMPT]
 
     @staticmethod
     def _build_beat_checklist(chapter_outline: dict) -> str:
@@ -400,6 +447,42 @@ class ChapterWriter:
         lines.append("不能区分 → 重写，直到声音独特为止。")
         lines.append("=" * 50)
         return "\n".join(lines)
+
+    # ── Hook marker parsing ──────────────────────────────────
+
+    _HOOK_MARKER_RE = __import__("re").compile(
+        r'<hook\s+action="(plant|advance|resolve)"'
+        r'(?:\s+id="([^"]*)")?'
+        r'\s+note="([^"]*)"'
+        r'(?:\s+priority="(major|minor)")?'
+        r'\s*/>'
+    )
+
+    @staticmethod
+    def parse_hook_markers(content: str) -> list[dict]:
+        """Extract structured hook actions from inline markers in content.
+
+        Returns a list of {action, hook_id?, note, priority?} dicts in
+        document order.
+        """
+        markers = []
+        for m in ChapterWriter._HOOK_MARKER_RE.finditer(content):
+            action = m.group(1)
+            hook_id = m.group(2) or None
+            note = m.group(3)
+            priority = m.group(4) or "minor"
+            markers.append({
+                "action": action,
+                "hook_id": hook_id,
+                "note": note,
+                "priority": priority,
+            })
+        return markers
+
+    @staticmethod
+    def strip_hook_markers(content: str) -> str:
+        """Remove all <hook .../> markers from content for clean display/storage."""
+        return ChapterWriter._HOOK_MARKER_RE.sub("", content)
 
     async def write(self, chapter_outline: dict, context_package: dict) -> str:
         system = SystemMessage(content=self.SYSTEM_PROMPT)

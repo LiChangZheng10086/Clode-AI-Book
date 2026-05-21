@@ -110,8 +110,8 @@ class WriteState(TypedDict):
     # A5 output
     chapter_outline: dict | None
     # A6 output
-    chapter_content: str | None
-    polished_content: str | None
+    chapter_content: str | None  # raw content with hook markers
+    polished_content: str | None  # clean content (markers stripped)
     # A7 output
     review_report: dict | None
     review_round: int
@@ -486,10 +486,14 @@ async def node_chapter_write(state: WriteState, config: RunnableConfig) -> dict:
         )
         await _emit(config, {"type": "content_stream", "content": content[:500] + "..."})
 
-    # Auto polish
+    # Strip hook markers before polishing (polisher sees clean text)
+    from engine.generator import ChapterWriter as CW
+    clean_content = CW.strip_hook_markers(content)
+
+    # Auto polish on clean text
     await _emit(config, {"type": "progress", "agent": "polisher", "message": "正在润色..."})
     polisher = Polisher()
-    polished = await polisher.polish(content)
+    polished = await polisher.polish(clean_content)
 
     await _emit(config, {"type": "agent_complete", "agent": "A6", "data": {"word_count": len(polished)}})
     return {"chapter_content": content, "polished_content": polished, "status": "writing_done"}
@@ -609,6 +613,7 @@ async def node_update_memory(state: WriteState, config: RunnableConfig) -> dict:
                 chapter_index=chapter_index,
                 chapter_content=content,
                 chapter_outline=chapter_outline,
+                marker_hooks=state.get("hook_actions"),
             )
             if mem_result:
                 parts: list[str] = []
@@ -628,6 +633,18 @@ async def node_update_memory(state: WriteState, config: RunnableConfig) -> dict:
                         "agent": "memory",
                         "message": "；".join(parts),
                     })
+
+                # Emit hook audit results
+                hook_audit = mem_result.get("hook_audit")
+                if hook_audit:
+                    health = hook_audit.get("health_score", 100)
+                    if health < 80:
+                        await _emit(config, {
+                            "type": "hook_health_warning",
+                            "agent": "hook_audit",
+                            "data": hook_audit,
+                            "message": f"伏笔健康度偏低（{health}/100）：{len(hook_audit.get('overdue', []))} 个逾期，{len(hook_audit.get('stale', []))} 个陈旧",
+                        })
 
                 # Emit consistency check results
                 consistency = mem_result.get("consistency_check")
@@ -683,16 +700,115 @@ def route_after_outline(state: WriteState) -> str:
     return "A5"  # Resume: re-enter to process decision_answer
 
 
+async def node_hook_process(state: WriteState, config: RunnableConfig) -> dict:
+    """Process hook markers from A6 content and update the HookRegistry.
+
+    Runs after review passes. Parses XML markers from raw content,
+    validates against DB, and batch-updates the registry.
+    """
+    novel_id = UUID(state["novel_id"])
+    chapter_index = state["chapter_index"]
+    raw_content = state.get("chapter_content") or ""
+    outline = state.get("chapter_outline") or {}
+
+    from engine.generator import ChapterWriter
+
+    # 1. Parse markers from raw content
+    markers = ChapterWriter.parse_hook_markers(raw_content)
+
+    # 2. Also collect hook_actions from outline (for pre-registered hooks)
+    outline_actions = outline.get("hook_actions", []) if isinstance(outline, dict) else []
+
+    # 3. Classify actions
+    new_hooks: list[dict] = []
+    advance_ids: list[UUID] = []
+    resolve_ids: list[UUID] = []
+
+    for m in markers:
+        action = m["action"]
+        if action == "plant":
+            new_hooks.append({
+                "description": m["note"],
+                "priority": m.get("priority", "minor"),
+                "hook_type": "mystery",
+                "target_chapter_range": None,
+                "related_entities": None,
+            })
+        elif action == "advance" and m.get("hook_id"):
+            try:
+                advance_ids.append(UUID(m["hook_id"]))
+            except ValueError:
+                logger.warning("Invalid hook_id in advance marker: %s", m["hook_id"])
+        elif action == "resolve" and m.get("hook_id"):
+            try:
+                resolve_ids.append(UUID(m["hook_id"]))
+            except ValueError:
+                logger.warning("Invalid hook_id in resolve marker: %s", m["hook_id"])
+
+    # 4. Deduplicate: resolve and advance on same hook → resolve wins
+    for rid in resolve_ids:
+        if rid in advance_ids:
+            advance_ids.remove(rid)
+
+    # 5. Update registry
+    registered = 0
+    resolved = 0
+    advanced = 0
+    try:
+        async with async_session() as db:
+            registry = HookRegistry(db)
+            await registry.process_hook_updates(
+                novel_id, chapter_index,
+                new_hooks=new_hooks,
+                resolved_hook_ids=resolve_ids,
+                advanced_hook_ids=advance_ids,
+            )
+            await db.commit()
+            registered = len(new_hooks)
+            resolved = len(resolve_ids)
+            advanced = len(advance_ids)
+    except Exception:
+        logger.exception("hook_process: HookRegistry update failed")
+
+    # 6. Report
+    parts: list[str] = []
+    if registered:
+        parts.append(f"注册 {registered} 个新伏笔")
+    if advanced:
+        parts.append(f"推进 {advanced} 个伏笔")
+    if resolved:
+        parts.append(f"回收 {resolved} 个伏笔")
+    if parts:
+        await _emit(config, {
+            "type": "progress",
+            "agent": "hook_process",
+            "message": "；".join(parts),
+        })
+
+    # Warn if markers claimed to resolve hooks not found in outline actions
+    if markers and not parts:
+        logger.info("hook_process: markers found but no valid actions parsed (ch %s)", chapter_index)
+
+    return {
+        "hook_actions": {
+            "new_hooks": new_hooks,
+            "advanced_ids": [str(h) for h in advance_ids],
+            "resolved_ids": [str(h) for h in resolve_ids],
+            "outline_actions": outline_actions,
+        },
+    }
+
+
 def route_after_review(state: WriteState) -> str:
     report = state.get("review_report", {})
     overall = report.get("overall", "revision_needed")
     round_num = state.get("review_round", 0)
 
     if overall == "pass":
-        return "update_memory"
+        return "hook_process"
     if round_num >= 3:
         logger.warning(f"Chapter {state.get('chapter_index')} failed review after 3 rounds, flagging for manual review")
-        return "update_memory"  # Force through, flag for human
+        return "hook_process"  # Force through, let hook_process handle any markers
     return "A6"  # Revision loop
 
 
@@ -702,12 +818,14 @@ def build_write_graph() -> StateGraph:
     graph.add_node("A5", node_chapter_outline)
     graph.add_node("A6", node_chapter_write)
     graph.add_node("A7", node_chapter_review)
+    graph.add_node("hook_process", node_hook_process)
     graph.add_node("update_memory", node_update_memory)
 
     graph.set_entry_point("A5")
     graph.add_conditional_edges("A5", route_after_outline, {"A5": "A5", "A6": "A6", END: END})
     graph.add_edge("A6", "A7")
-    graph.add_conditional_edges("A7", route_after_review, {"A6": "A6", "update_memory": "update_memory"})
+    graph.add_conditional_edges("A7", route_after_review, {"A6": "A6", "hook_process": "hook_process"})
+    graph.add_edge("hook_process", "update_memory")
     graph.add_edge("update_memory", END)
 
     return graph.compile(checkpointer=MemorySaver())

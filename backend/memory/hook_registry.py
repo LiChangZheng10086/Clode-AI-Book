@@ -105,3 +105,68 @@ class HookRegistry:
                 await self.mark_resolved(hid, chapter_index)
         if advanced_hook_ids:
             await self.mark_advanced(advanced_hook_ids)
+
+    async def audit_hooks(
+        self, novel_id: UUID, current_chapter_index: int
+    ) -> dict:
+        """Global hook health audit.
+
+        Returns a report with overdue, stale, and at-risk hooks.
+        """
+        result = await self.db.execute(
+            select(Hook)
+            .where(Hook.novel_id == novel_id)
+            .where(Hook.status.in_(["unresolved", "in_progress"]))
+            .order_by(Hook.priority.desc(), Hook.planted_chapter_index)
+        )
+        all_pending = result.scalars().all()
+
+        overdue: list[dict] = []
+        stale: list[dict] = []
+        no_target: list[dict] = []
+
+        for h in all_pending:
+            info = {
+                "id": str(h.id),
+                "type": h.hook_type,
+                "description": h.description,
+                "planted": h.planted_chapter_index,
+                "target": h.target_chapter_range,
+                "priority": h.priority,
+                "status": h.status,
+            }
+            target = h.target_chapter_range
+            if target and isinstance(target, list) and len(target) == 2:
+                if current_chapter_index > target[1]:
+                    overdue.append(info)
+                elif current_chapter_index > target[0] and h.status == "unresolved":
+                    stale.append(info)
+            elif h.planted_chapter_index and current_chapter_index - h.planted_chapter_index > 10:
+                # No target range set, and planted >10 chapters ago
+                no_target.append(info)
+            elif h.planted_chapter_index and current_chapter_index - h.planted_chapter_index > 5:
+                stale.append(info)
+
+        # Also find hooks that haven't been touched without target range
+        return {
+            "total_pending": len(all_pending),
+            "overdue": overdue,
+            "stale": stale,
+            "no_target_range": no_target,
+            "health_score": _compute_health_score(
+                len(all_pending), len(overdue), len(stale), len(no_target)
+            ),
+        }
+
+
+def _compute_health_score(
+    total: int, overdue: int, stale: int, no_target: int
+) -> int:
+    """Compute hook health score 0-100. Higher is healthier."""
+    if total == 0:
+        return 100
+    penalty = 0
+    penalty += min(overdue * 15, 45)   # Overdue is worst
+    penalty += min(stale * 8, 25)       # Stale is moderate
+    penalty += min(no_target * 5, 10)   # No target range is minor
+    return max(0, 100 - penalty)
