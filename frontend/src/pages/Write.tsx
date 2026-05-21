@@ -159,6 +159,11 @@ export default function Write() {
         }
         break;
 
+      case "style_drift_warning":
+        console.warn("[Write] Style drift detected:", msg.message);
+        // Show as a temporary banner — the profile has already been auto-corrected
+        break;
+
       case "error":
         console.error("Write WS error:", msg.message);
         break;

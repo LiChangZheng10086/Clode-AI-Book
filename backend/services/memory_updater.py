@@ -312,7 +312,7 @@ async def run_memory_updates(
             result["entity_states_updated"] = len(entity_states)
             logger.info("Updated %d entity states for ch %s", len(entity_states), chapter_index)
 
-        # 6. Periodic consistency check (same interval as full recompute)
+        # 6. Periodic consistency check + style recalibration
         if do_full_recompute:
             try:
                 from engine.consistency import ConsistencyChecker
@@ -359,6 +359,22 @@ async def run_memory_updates(
                     )
             except Exception:
                 logger.exception("Consistency check failed")
+
+            # 7. Style recalibration — detect and correct writing style drift
+            try:
+                from services.style_recalibrator import recalibrate_style
+                style_result = await recalibrate_style(novel_id)
+                if style_result:
+                    drift = style_result.get("drift_score", 100)
+                    corrections = style_result.get("corrections", [])
+                    result["style_recalibration"] = style_result
+                    if drift < 85:
+                        logger.info(
+                            "Style drift detected for novel %s at ch %s: score=%d, corrections=%d",
+                            novel_id, chapter_index, drift, len(corrections),
+                        )
+            except Exception:
+                logger.exception("Style recalibration failed")
 
         await db.commit()
 

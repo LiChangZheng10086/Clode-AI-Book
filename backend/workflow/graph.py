@@ -647,6 +647,25 @@ async def node_update_memory(state: WriteState, config: RunnableConfig) -> dict:
                             "agent": "consistency",
                             "message": f"一致性检查通过（评分: {score}/10）",
                         })
+
+                # Emit style recalibration results
+                style_recal = mem_result.get("style_recalibration")
+                if style_recal:
+                    drift = style_recal.get("drift_score", 100)
+                    corrections = style_recal.get("corrections", [])
+                    if drift < 85:
+                        await _emit(config, {
+                            "type": "style_drift_warning",
+                            "agent": "style_recalibrator",
+                            "data": style_recal,
+                            "message": f"检测到风格漂移（评分: {drift}/100，{len(corrections)} 项需校正），已自动更新风格画像",
+                        })
+                    else:
+                        await _emit(config, {
+                            "type": "progress",
+                            "agent": "style_recalibrator",
+                            "message": f"风格一致性检查通过（评分: {drift}/100）",
+                        })
         except Exception:
             logger.exception("Memory updates failed for novel %s ch %s", novel_id, chapter_index)
 
